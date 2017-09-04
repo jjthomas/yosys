@@ -173,6 +173,12 @@ struct FirrtlWorker
 			else
 			{
 				wire_decls.push_back(stringf("    wire %s: UInt<%d>\n", make_id(wire->name), wire->width));
+				json wire_instance;
+				wire_instance["genref"] = "coreir.wire";
+				json genargs;
+				genargs["width"] = stringf("%d", wire->width);
+				wire_instance["genargs"] = genargs;
+				this_module["instances"][stringf("%s", make_id(wire->name))] = wire_instance;
 			}
 		}
 
