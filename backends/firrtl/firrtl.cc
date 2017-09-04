@@ -80,6 +80,10 @@ struct FirrtlWorker
 	Module *module;
 	json &js;
 	std::ostream &f;
+	int literal_counter;
+	int slice_counter;
+	int cat_counter;
+	int primop_counter;
 
 	dict<SigBit, pair<string, int>> reverse_wire_map;
 	string unconn_id;
@@ -90,7 +94,7 @@ struct FirrtlWorker
 			reverse_wire_map[sig[i]] = make_pair(id, i);
 	}
 
-	FirrtlWorker(Module *module, json &js, std::ostream &f) : module(module), js(js), f(f)
+	FirrtlWorker(Module *module, json &js, std::ostream &f) : module(module), js(js), f(f), literal_counter(0), slice_counter(0), cat_counter(0), primop_counter(0)
 	{
 	}
 
@@ -139,6 +143,97 @@ struct FirrtlWorker
 		}
 
 		return expr;
+	}
+
+	string make_json(SigSpec sig, json &cur_module)
+	{
+		string cur_out;
+		int cur_width;
+		string old_out;
+		int old_width;
+
+		for (auto chunk : sig.chunks())
+		{
+			string new_expr;
+			if (chunk.wire == nullptr)
+			{
+				std::vector<RTLIL::State> bits = chunk.data;
+
+				while (GetSize(bits) % 4 != 0)
+					bits.push_back(State::S0);
+
+				for (int i = GetSize(bits)-4; i >= 0; i -= 4)
+				{
+					int val = 0;
+					if (bits[i+0] == State::S1) val += 1;
+					if (bits[i+1] == State::S1) val += 2;
+					if (bits[i+2] == State::S1) val += 4;
+					if (bits[i+3] == State::S1) val += 8;
+					new_expr.push_back(val < 10 ? '0' + val : 'a' + val - 10);
+				}
+				json literal_instance;
+				literal_instance["genref"] = "coreir.literal";
+				json genargs;
+				genargs["width"] = stringf("%d", GetSize(bits));
+				genargs["value"] = new_expr;
+				literal_instance["genargs"] = genargs;
+				string lit_id = stringf("lit_%d", literal_counter++);
+				cur_module["instances"][lit_id] = literal_instance;
+				cur_out = lit_id + ".out";
+				cur_width = GetSize(bits);
+
+
+			}
+			else if (chunk.offset == 0 && chunk.width == chunk.wire->width)
+			{
+				cur_out = stringf("%s", make_id(chunk.wire->name))  + ".out";
+				cur_width = chunk.width;
+			}
+			else
+			{
+				string wire_id = make_id(chunk.wire->name);
+				json slice_instance;
+				slice_instance["genref"] = "coreir.slice";
+				json genargs;
+				genargs["width"] = stringf("%d", chunk.wire->width);
+				genargs["lo"] = stringf("%d", chunk.offset);
+				genargs["hi"] = stringf("%d", chunk.offset + chunk.width - 1);
+				slice_instance["genargs"] = genargs;
+				string slice_id = stringf("slice_%d", slice_counter++);
+				cur_module["instances"][slice_id] = slice_instance;
+				json in_conn;
+				in_conn.push_back(slice_id + ".in");
+				in_conn.push_back(wire_id + ".out");
+				cur_module["connections"].push_back(in_conn);
+				cur_out = slice_id + ".out";
+				cur_width = chunk.width;
+			}
+
+			if (!old_out.empty()) {
+				json cat_instance;
+				cat_instance["genref"] = "coreir.cat";
+				json genargs;
+				genargs["width0"] = stringf("%d", cur_width);
+				genargs["width1"] = stringf("%d", old_width);
+				cat_instance["genargs"] = genargs;
+				string cat_id = stringf("cat_%d", cat_counter++);
+				cur_module["instances"][cat_id] = cat_instance;
+				json conn0;
+				conn0.push_back(cat_id + ".in0");
+				conn0.push_back(cur_out);
+				cur_module["connections"].push_back(conn0);
+				json conn1;
+				conn1.push_back(cat_id + ".in1");
+				conn1.push_back(old_out);
+				cur_module["connections"].push_back(conn1);
+				cur_out = cat_id + ".out";
+				cur_width = cur_width + old_width;
+			}
+			old_out = cur_out;
+			old_width = cur_width;
+		}
+
+		return cur_out;
 	}
 
 	void run()
@@ -190,13 +285,22 @@ struct FirrtlWorker
 				bool is_signed = cell->parameters.at("\\A_SIGNED").as_bool();
 				int y_width =  cell->parameters.at("\\Y_WIDTH").as_int();
 				string a_expr = make_expr(cell->getPort("\\A"));
+				string a_json_ref = make_json(cell->getPort("\\A"), this_module);
 				wire_decls.push_back(stringf("    wire %s: UInt<%d>\n", y_id.c_str(), y_width));
+				// TODO refactor wire creation code into a function
+				json wire_instance;
+				wire_instance["genref"] = "coreir.wire";
+				json genargs;
+				genargs["width"] = stringf("%d", y_width);
+				wire_instance["genargs"] = genargs;
+				this_module["instances"][stringf("%s", y_id.c_str())] = wire_instance;
 
 				if (cell->parameters.at("\\A_SIGNED").as_bool()) {
 					a_expr = "asSInt(" + a_expr + ")";
 				}
 
 				a_expr = stringf("pad(%s, %d)", a_expr.c_str(), y_width);
+				// TODO should handling padding in CoreIR output as well
 
 				string primop;
                                 bool always_uint = false;
@@ -226,6 +330,22 @@ struct FirrtlWorker
 				cell_exprs.push_back(stringf("    %s <= %s\n", y_id.c_str(), expr.c_str()));
 				register_reverse_wire_map(y_id, cell->getPort("\\Y"));
 
+				json op_instance;
+				op_instance["genref"] = stringf("coreir.%s", primop.c_str());
+				json genargs2;
+				genargs2["width"] = stringf("%d", y_width);
+				op_instance["genargs"] = genargs2;
+				string primop_id = stringf("%s_%d", primop.c_str(), primop_counter++);
+				this_module["instances"][primop_id] = op_instance;
+				json in_conn;
+				in_conn.push_back(primop_id + ".in");
+				in_conn.push_back(a_json_ref);
+				this_module["connections"].push_back(in_conn);
+				json out_conn;
+				out_conn.push_back(primop_id + ".out");
+				out_conn.push_back(y_id + ".in");
+				this_module["connections"].push_back(out_conn);
+
 				continue;
 			}
 			if (cell->type.in("$add", "$sub", "$mul", "$div", "$mod", "$xor", "$and", "$or", "$eq", "$eqx",
@@ -238,6 +358,7 @@ struct FirrtlWorker
 				string a_expr = make_expr(cell->getPort("\\A"));
 				string b_expr = make_expr(cell->getPort("\\B"));
 				wire_decls.push_back(stringf("    wire %s: UInt<%d>\n", y_id.c_str(), y_width));
+
 
 				if (cell->parameters.at("\\A_SIGNED").as_bool()) {
 					a_expr = "asSInt(" + a_expr + ")";
@@ -337,6 +458,7 @@ struct FirrtlWorker
 				string b_expr = make_expr(cell->getPort("\\B"));
 				string s_expr = make_expr(cell->getPort("\\S"));
 				wire_decls.push_back(stringf("    wire %s: UInt<%d>\n", y_id.c_str(), width));
+
 
 				string expr = stringf("mux(%s, %s, %s)", s_expr.c_str(), b_expr.c_str(), a_expr.c_str());
 
@@ -603,7 +725,7 @@ struct FirrtlBackend : public Backend {
 		js["namespaces"]["global"]["modules"] = json();
 
 		std::filebuf fb;
-		fb.open("dummy.txt", std::ios::out);
+		fb.open("real_firrtl.txt", std::ios::out);
 		std::ostream os(&fb);
 		os << stringf("circuit %s:\n", make_id(top->name));
 		for (auto module : design->modules())
