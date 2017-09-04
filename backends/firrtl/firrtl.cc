@@ -23,7 +23,12 @@
 #include "kernel/celltypes.h"
 #include "kernel/cellaigs.h"
 #include "kernel/log.h"
+#include "json.hpp"
 #include <string>
+#include <iostream>
+#include <fstream>
+
+using json = nlohmann::json;
 
 USING_YOSYS_NAMESPACE
 PRIVATE_NAMESPACE_BEGIN
@@ -73,6 +78,7 @@ const char *make_id(IdString id)
 struct FirrtlWorker
 {
 	Module *module;
+	json &js;
 	std::ostream &f;
 
 	dict<SigBit, pair<string, int>> reverse_wire_map;
@@ -84,7 +90,7 @@ struct FirrtlWorker
 			reverse_wire_map[sig[i]] = make_pair(id, i);
 	}
 
-	FirrtlWorker(Module *module, std::ostream &f) : module(module), f(f)
+	FirrtlWorker(Module *module, json &js, std::ostream &f) : module(module), js(js), f(f)
 	{
 	}
 
@@ -137,7 +143,12 @@ struct FirrtlWorker
 
 	void run()
 	{
-		f << stringf("  module %s:\n", make_id(module->name));
+		json this_module;
+		this_module["type"] = json();
+		this_module["type"].push_back("Record");
+		this_module["type"].push_back(json());
+		this_module["instances"] = json();
+		this_module["connections"] = json();
 		vector<string> port_decls, wire_decls, cell_exprs, wire_exprs;
 
 		for (auto wire : module->wires())
@@ -148,6 +159,16 @@ struct FirrtlWorker
 					log_error("Module port %s.%s is inout!\n", log_id(module), log_id(wire));
 				port_decls.push_back(stringf("    %s %s: UInt<%d>\n", wire->port_input ? "input" : "output",
 						make_id(wire->name), wire->width));
+				if (wire->width == 1) {
+				  this_module["type"][1][stringf("%s", make_id(wire->name))] = stringf("%s", wire->port_input ? "BitIn" : "Bit");
+				} else {
+				  json type_array;
+				  type_array.push_back("Array");
+				  type_array.push_back(stringf("%d", wire->width));
+				  type_array.push_back(stringf("%s", wire->port_input ? "BitIn" : "Bit"));
+                                  this_module["type"][1][stringf("%s", make_id(wire->name))] = type_array;
+				}
+
 			}
 			else
 			{
@@ -522,6 +543,8 @@ struct FirrtlWorker
 
 		for (auto str : wire_exprs)
 			f << str;
+
+		js[stringf("%s", make_id(module->name))] = this_module;
 	}
 };
 
@@ -566,13 +589,24 @@ struct FirrtlBackend : public Backend {
 					make_id(wire->name);
 		}
 
-		*f << stringf("circuit %s:\n", make_id(top->name));
 
+		json js;
+		js["top"] = stringf("global.%s", make_id(top->name));
+		js["namespaces"] = json();
+		js["namespaces"]["global"] = json();
+		js["namespaces"]["global"]["modules"] = json();
+
+		std::filebuf fb;
+		fb.open("dummy.txt", std::ios::out);
+		std::ostream os(&fb);
+		os << stringf("circuit %s:\n", make_id(top->name));
 		for (auto module : design->modules())
 		{
-			FirrtlWorker worker(module, *f);
+			FirrtlWorker worker(module, js["namespaces"]["global"]["modules"], os);
 			worker.run();
 		}
+                *f << std::setw(2) << js;
+		fb.close();
 
 		namecache.clear();
 		autoid_counter = 0;
