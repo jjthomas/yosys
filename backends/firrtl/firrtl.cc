@@ -343,6 +343,8 @@ struct FirrtlWorker
 				this_module["connections"].push_back(in_conn);
 				json out_conn;
 				out_conn.push_back(primop_id + ".out");
+				// TODO this assumes that y is the name of a wire module, but this isn't always true -- e.g. it
+				// it may be an inuput to the module, in which case it has no ".in" field
 				out_conn.push_back(y_id + ".in");
 				this_module["connections"].push_back(out_conn);
 
